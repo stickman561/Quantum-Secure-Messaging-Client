@@ -45,6 +45,7 @@ const PEER_CONNECTION_REQUEST: &str = "We Shall Sail Together.";
 const PEER_AUTHENTICATION: &str = "Hello there.";
 const PEER_AUTH_RESPONSE: &str = "General Kenobi.";
 const SHARED_SECRET_TEST_MESSAGE: &str = "Wake Up, Neo.";
+const DISCONNECT_MESSAGE: &str = "END OF LINE";
 
 // The standard range of valid ports.
 const PORT_RANGE: RangeInclusive<u16> = 1024..=49151;
@@ -85,7 +86,7 @@ fn main() {
     else if response.contains(ISSUED_CHALLENGE) {
 
         // Sometimes the hex transmitted introduces invisible formatting characters.
-        let nonce_hex = response.split("\n").last().expect("Error receiving nonce.");
+        let nonce_hex = response.split('\n').last().expect("Error receiving nonce.");
 
         let nonce = hex::decode(nonce_hex).expect("Unable to decode nonce.");
 
@@ -313,7 +314,8 @@ fn connection_mode(
         }
 
         else {
-            println!("Connection declined. END OF LINE");
+            println!("Connection declined.");
+            println!("{}", DISCONNECT_MESSAGE);
             exit(0);
         }
 
@@ -419,12 +421,13 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
     println!("Please confirm through a third-party channel that this matches with your peer's.");
     println!("This is an important step to prevent man-in-the-middle attacks.\n");
 
+    // Transmission thread.
     let tx = thread::spawn(move || {
         
         for line in stdin().lock().lines() {
             match line {
                 Ok(message) => {
-                    if message.starts_with(">") {
+                    if message.starts_with('>') {
                         if message.to_lowercase().contains("exit") {
 
                             // Securely Zero the Final Key (Prior keys Zeroed during cycle.)
@@ -443,7 +446,7 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
                         }
                     }
 
-                    else {
+                    else if !message.is_empty() {
                         transmitter_counter.fetch_add(1, Ordering::SeqCst);
                         let encrypted = encrypt_message(&transmitter_key, message.as_str());
                         if let Err(e) = write_message(&mut transmitter, encrypted.as_bytes()) {
@@ -463,6 +466,7 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
         }
     });
 
+    // Reception thread.
     let rx = thread::spawn(move || {
 
         loop {
@@ -472,6 +476,7 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
                     receiver_counter.fetch_add(1, Ordering::SeqCst);
                     receiver_key = cycle_symmetric_key(receiver_key, &receiver_counter);
                     stdout().flush().unwrap();
+
                 }
                 
                 _ => {
@@ -610,15 +615,15 @@ fn read_message(stream: &mut TcpStream) -> String {
                         String::from("Invalid Response")
                     }
                 },
-                Err(e) => {
-                    eprintln!("Invalid response from server: {}", e);
-                    exit(1);
+                Err(_) => {
+                    eprintln!("{}", DISCONNECT_MESSAGE);
+                    exit(0);
                 }
             }
         },
-        Err(e) => {
-            eprintln!("Invalid response from server: {}", e);
-            exit(1);
+        Err(_) => {
+            eprintln!("{}", DISCONNECT_MESSAGE);
+            exit(0);
         }
     }
 }
@@ -714,7 +719,9 @@ fn derive_symmetric_key(shared_secret: &SharedSecretKey) -> Vec<u8> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret.clone().into_bytes().as_slice());
     let mut okm = [0u8; 32]; // Output key material (32 bytes for AES-256)
     hk.expand(b"encryption key", &mut okm).unwrap();
-    okm.to_vec()
+    let result = okm.to_vec();
+    okm.zeroize();
+    result
 }
 
 // Derive a new symmetric key based on an atomic counter.
@@ -745,15 +752,15 @@ fn encrypt_message(symmetric_key: &[u8], plaintext: &str) -> String {
     // Pad plaintext to obscure message length.
     let mut plaintext_bytes = Vec::from(plaintext.as_bytes());
 
-    // We'll randomly pad each message with somewhere from 10 to 255 bytes of random data.
-    let padding_byte_length: u8 = u8::MAX - (plaintext_bytes.len() % u8::MAX as usize) as u8;
-    let mut padding_bytes = vec![0u8; padding_byte_length as usize];
+    // All messages are padded to a multiple of 2KB.
+    let padding_byte_length: [u8; 2] = (2048u16 - (plaintext_bytes.len() % 2048) as u16).to_be_bytes();
+    let mut padding_bytes = vec![0u8; u16::from_be_bytes(padding_byte_length) as usize];
     
     OsRng.try_fill_bytes(&mut padding_bytes).expect("Unable to securely pad message.");
     
-    // The last byte we pad will tell us how many padding bytes we need to strip during
+    // The last two bytes we pad will tell us how many padding bytes we need to strip during
     // decryption. This value will be encrypted along with the plaintext, so leaks no information.
-    padding_bytes.push(padding_byte_length);
+    padding_bytes.extend(padding_byte_length);
     
     // Add the padding to the plaintext.
     plaintext_bytes.extend(padding_bytes);
@@ -817,13 +824,13 @@ fn decrypt_message(symmetric_key: &[u8], raw_cipher: &str) -> String {
     let mut plaintext_bytes = cipher.decrypt(
         Nonce::from_slice(nonce.as_slice()),
         ciphertext.as_slice()
-    ).unwrap_or(Vec::from(b"Decryption error."));
+    ).unwrap_or_else(|_| Vec::from(b"Decryption error."));
 
     // Strip message padding for display.
-    let padding_length = plaintext_bytes.last().unwrap();
+    let padding_length = u16::from_be_bytes(plaintext_bytes[plaintext_bytes.len() - 2..].try_into().unwrap());
     
-    // Don't forget to truncate one additional byte to remove the padding length marker.
-    plaintext_bytes.truncate(plaintext_bytes.len() - (*padding_length as usize + 1));
+    // Don't forget to truncate two additional bytes to remove the padding length marker.
+    plaintext_bytes.truncate(plaintext_bytes.len() - (padding_length as usize + 2));
 
     // Securely Zero sensitive values in memory before drop.
     encryption_key.zeroize();
