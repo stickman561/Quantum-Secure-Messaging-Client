@@ -8,11 +8,13 @@ use std::ops::RangeInclusive;
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::generic_array::GenericArray;
+use aes_gcm::aead::rand_core::Error;
 use dialoguer::{Confirm, Select};
 use fips203::{ml_kem_1024, SharedSecretKey};
 use fips203::traits::{Decaps, Encaps, KeyGen};
@@ -23,10 +25,12 @@ use fips204::traits::SerDes as SerDesDilithium;
 use hkdf::Hkdf;
 use hkdf::hmac::{Hmac, Mac};
 use igd_next::{PortMappingProtocol, SearchOptions};
-use rand::{random, Rng, RngCore};
-use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::{RngCore, TryRngCore};
+use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretSlice, SecretString};
+use sha2::{Digest, Sha512};
+use subtle_encoding::hex;
 
 // Standard delimiters.
 const TRANSMISSION_DELIMITER: &str = ":::";
@@ -37,18 +41,46 @@ const SIGNATURE_CONTEXT: &[u8] = b"\xCE\xB1";
 
 // The messages peers and the server should transmit.
 const AUTHENTICATION_REQUEST: &str = "Friend requesting access.";
-const SESSION_REQUEST: &str = "もうすぐ私に会えますよ";
+const SESSION_REQUEST: &str = "もうすぐ私に会えますよ"; // 山村貞子、『リング』 - Sadako Yamamura/Samara Morgan, The Ring (Remake, 2002)
 const ISSUED_CHALLENGE: &str = "Welcome Anon. Here's your challenge:";
 const VERIFIED_PEER: &str = "You're in.";
-const PEER_KEYS_RECEIVED: &str = "I see you have constructed a new lightsaber.";
-const PEER_CONNECTION_REQUEST: &str = "We Shall Sail Together.";
-const PEER_AUTHENTICATION: &str = "Hello there.";
-const PEER_AUTH_RESPONSE: &str = "General Kenobi.";
-const SHARED_SECRET_TEST_MESSAGE: &str = "Wake Up, Neo.";
-const DISCONNECT_MESSAGE: &str = "END OF LINE";
+const PEER_KEYS_RECEIVED: &str = "I see you have constructed a new lightsaber."; // Darth Vader, Star Wars (Return of the Jedi, 1983)
+const PEER_CONNECTION_REQUEST: &str = "We Shall Sail Together."; // Sea of Thieves (Rare Games, 2018)
+const HEARTBEAT_PROMPT: &str = "Are you still there?"; // Turret, Portal (Valve, 2007)
+const HEARTBEAT_RESPONSE: &str = "There you are."; // Turret, Portal (Valve, 2007)
+const PEER_AUTHENTICATION: &str = "Hello there."; // Obi-Wan Kenobi, Star Wars (Revenge of the Sith, 2005)
+const PEER_AUTH_RESPONSE: &str = "General Kenobi."; // Qymaen jai Sheelal "General Grievous", Star Wars (Revenge of the Sith, 2005)
+const SHARED_SECRET_TEST_MESSAGE: &str = "Wake Up, Neo..."; // Morpheus, The Matrix (Original Film, 1999)
+const DISCONNECT_MESSAGE: &str = "END OF LINE"; // Master Control Program "MCP", Tron (Original Film, 1982)
 
-// The standard range of valid ports.
+// The standard range of valid UPnP ports.
 const PORT_RANGE: RangeInclusive<u16> = 1024..=49151;
+
+// Bindings to allow ChaCha20 Use with FIPS203/FIPS204 Crates
+struct FipsChaCha20(ChaCha20Rng);
+
+// fips203 and fips204 share this trait
+impl fips203::RngCore for FipsChaCha20 {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest)
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
+        // try_fill_bytes is marked as Infallible for ChaCha20
+        // It can't error out the same way OsRng can, making this safe.
+        self.0.try_fill_bytes(dest).map_err(|_| unreachable!())
+    }
+}
+
+impl fips203::CryptoRng for FipsChaCha20 {}
 
 fn main() {
 
@@ -59,7 +91,7 @@ fn main() {
     let (dilithium_public, dilithium_private) = generate_dilithium_keys();
 
     // Serialize the key for transmission
-    let serialized_pubkey = hex::encode(dilithium_public.clone().into_bytes());
+    let serialized_pubkey = hex::encode(dilithium_public.expose_secret().clone().into_bytes());
 
     // Allow user to enter target exchange server address.
     println!("Enter target exchange server address and port:");
@@ -77,21 +109,21 @@ fn main() {
     let response = read_message(&mut server);
 
     // Connection denied
-    if response.to_lowercase().contains("invalid") {
+    if response.expose_secret().to_lowercase().contains("invalid") {
         eprintln!("The server has rejected this connection.");
         exit(0);
     }
 
     // Connection accepted, challenge received
-    else if response.contains(ISSUED_CHALLENGE) {
+    else if response.expose_secret().contains(ISSUED_CHALLENGE) {
 
         // Sometimes the hex transmitted introduces invisible formatting characters.
-        let nonce_hex = response.split('\n').last().expect("Error receiving nonce.");
+        let nonce_hex = response.expose_secret().split('\n').last().expect("Error receiving nonce.");
 
-        let nonce = hex::decode(nonce_hex).expect("Unable to decode nonce.");
+        let nonce = SecretSlice::from(hex::decode(nonce_hex).expect("Unable to decode nonce."));
 
         // Sign the nonce
-        let nonce_signature = serialize_dilithium_signature(&dilithium_private, &nonce);
+        let nonce_signature = serialize_dilithium_signature(&dilithium_private, nonce);
 
         // Transmit the signature to the server. Consists of:
 
@@ -102,19 +134,19 @@ fn main() {
          */
         write_to_server(&mut server,
                         vec![
-                            serialized_pubkey.as_str(),
+                            String::from_utf8(serialized_pubkey).expect("Error serializing public key.").as_str(),
                             nonce_hex,
-                            nonce_signature.as_str()
+                            nonce_signature.expose_secret()
                         ]
         );
 
         // Check authentication.
         let authentication_status = read_message(&mut server);
 
-        println!("{}", authentication_status);
+        println!("{}", authentication_status.expose_secret());
 
         // Authentication successful.
-        if authentication_status == VERIFIED_PEER {
+        if authentication_status.expose_secret() == VERIFIED_PEER {
 
             // Generate our Kyber keys. Similar to Dilithium, this
             // needs to be offloaded to reduce the Stack Pressure.
@@ -133,18 +165,18 @@ fn main() {
              */
             write_to_server(&mut server,
                             vec![
-                                serialize_dilithium_key(&dilithium_public).as_str(),
-                                serialize_kyber_key(&kyber_public).as_str(),
-                                serialize_dilithium_signature(&dilithium_private, &kyber_public.clone().into_bytes()).as_str()
+                                serialize_dilithium_key(&dilithium_public).expose_secret(),
+                                serialize_kyber_key(&kyber_public).expose_secret(),
+                                serialize_dilithium_signature(&dilithium_private, SecretSlice::from(kyber_public.expose_secret().clone().into_bytes().to_vec())).expose_secret(),
                             ]
             );
 
             // Confirm the server has linked our keys and added us to the pool.
             let verification_status = read_message(&mut server);
 
-            if verification_status == PEER_KEYS_RECEIVED {
+            if verification_status.expose_secret() == PEER_KEYS_RECEIVED {
                 // Prepare for connection.
-                connection_mode(server, Box::from(dilithium_private), Box::from(kyber_public), Box::from(kyber_private));
+                connection_mode(server, &dilithium_private, &kyber_public, &kyber_private);
             }
 
         }
@@ -162,9 +194,9 @@ fn main() {
 // in order to safely take ownership without blowing up the Stack.
 fn connection_mode(
     mut server: TcpStream,
-    mut dilithium_private: Box<ml_dsa_87::PrivateKey>,
-    kyber_public: Box<ml_kem_1024::EncapsKey>,
-    mut kyber_private: Box<ml_kem_1024::DecapsKey>
+    dilithium_private: &SecretBox<ml_dsa_87::PrivateKey>,
+    kyber_public: &SecretBox<ml_kem_1024::EncapsKey>,
+    kyber_private: &SecretBox<ml_kem_1024::DecapsKey>
                   )
 {
     // Clear all prior console input.
@@ -173,7 +205,7 @@ fn connection_mode(
     // Display the user's public key.
     println!("This is your public ID. Copy it down to share with your peer.");
     println!("WARNING: You will not see it again!");
-    println!("\n{}", serialize_kyber_key(&kyber_public));
+    println!("\n{}", serialize_kyber_key(kyber_public).expose_secret());
 
     // Wait for the user to continue.
     println!("\nPress Enter to continue...");
@@ -207,16 +239,16 @@ fn connection_mode(
         stdin().read_line(&mut peer_id).expect("Error reading input.");
 
         // Attempt to decode our peer's public key from the input.
-        let peer_kyber_key = ml_kem_1024::EncapsKey::try_from_bytes(
+        let peer_kyber_key = SecretBox::from(Box::from(ml_kem_1024::EncapsKey::try_from_bytes(
             <[u8; 1568]>::try_from(
                 hex::decode(
                     peer_id.trim()
                 ).expect("Invalid hex detected.")
             ).unwrap()
-        ).expect("Invalid peer key.");
+        ).expect("Invalid peer key.")));
 
         // Establish a shared secret with the target Peer ID and our local one.
-        let (shared_secret, ciphertext) = peer_kyber_key.try_encaps().unwrap();
+        let (shared_secret, ciphertext) = peer_kyber_key.expose_secret().try_encaps().unwrap();
 
         clearscreen::clear().unwrap();
 
@@ -241,11 +273,11 @@ fn connection_mode(
         write_to_server(&mut flag_signal,
                         vec![
                             SESSION_REQUEST,
-                            serialize_kyber_key(&kyber_public).as_str(),
-                            serialize_kyber_key(&peer_kyber_key).as_str(),
-                            serialize_dilithium_signature(&dilithium_private, &hex::decode(peer_id.trim()).unwrap()).as_str(),
-                            encrypt_message(&derive_symmetric_key(&shared_secret), &listening_port.to_string()).as_str(),
-                            serialize_ciphertext(&ciphertext).as_str()
+                            serialize_kyber_key(kyber_public).expose_secret(),
+                            serialize_kyber_key(&peer_kyber_key).expose_secret(),
+                            serialize_dilithium_signature(dilithium_private, SecretBox::from(hex::decode(peer_id.trim()).unwrap())).expose_secret(),
+                            encrypt_message(&derive_symmetric_key(&shared_secret), &listening_port.to_string()).expose_secret(),
+                            serialize_ciphertext(&ciphertext).expose_secret(),
                         ]
         );
 
@@ -259,7 +291,7 @@ fn connection_mode(
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => { host_message_mode(stream); break; },
-                Err(e) => eprintln!("Connection failed: {}", e),
+                Err(e) => eprintln!("Connection failed: {}", e)
             }
         }
     }
@@ -272,61 +304,72 @@ fn connection_mode(
      *   The sender's listening port, encrypted using our public key.
      */
     else {
+        let mut connection_attempt = false;
 
         clearscreen::clear().unwrap();
 
-        println!("The quieter you become, the more you can hear. Listening...");
+        while !connection_attempt {
+            println!("The quieter you become, the more you can hear. Listening...");
+            let mut request_components: Vec<String>;
 
-        let mut incoming_request;
-        let mut request_components: Vec<&str>;
+            loop {
+                let incoming_request = read_message(&mut server);
 
-        loop {
-            incoming_request = read_message(&mut server);
+                request_components = incoming_request.expose_secret().split(TRANSMISSION_DELIMITER).map(String::from).collect();
 
-            request_components = incoming_request.split(TRANSMISSION_DELIMITER).collect();
+                if incoming_request.expose_secret().contains(PEER_CONNECTION_REQUEST) && request_components.len() == 5 {
+                    break;
+                }
 
-            if incoming_request.contains(PEER_CONNECTION_REQUEST) && request_components.len() == 5 {
-                break;
+                if incoming_request.expose_secret().contains(HEARTBEAT_PROMPT) {
+                    write_to_server(&mut server, vec![HEARTBEAT_RESPONSE]);
+                }
+            }
+
+            let incoming_key = request_components[1].clone();
+            let peer_address = request_components[2].clone();
+            let encrypted_port = request_components[3].clone();
+            let ciphertext = request_components[4].clone();
+
+            let shared_secret = kyber_private.expose_secret().try_decaps(deserialize_ciphertext(&ciphertext).expose_secret()).expect("Shared secret could not be established.");
+
+            let peer_port = decrypt_message(&derive_symmetric_key(&shared_secret), &encrypted_port);
+
+            clearscreen::clear().unwrap();
+
+            // 30 Seconds to Accept Connection before automated timeout.
+            // This is to prevent crashes caused by DDOS attempts with valid requests.
+            let (prompter, receiver) = channel();
+
+            thread::spawn(move || {
+                let start_session = Confirm::new()
+                    .with_prompt(format!("Incoming Request From Peer:\n{}\n\nInitiate Session?", incoming_key))
+                    .interact()
+                    .unwrap_or(false);
+                let _ = prompter.send(start_session);
+            });
+
+            match receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(true) => {
+                        connection_attempt = true;
+                        listener_message_mode(TcpStream::connect(
+                            format!("{}:{}", peer_address, peer_port.expose_secret())
+                        ).expect("Failed to connect to peer.")
+                    );
+                },
+
+                Ok(false) => {
+                    println!("Connection declined.");
+                    println!("{}", DISCONNECT_MESSAGE);
+                },
+
+                _ => {
+                    println!("Connection failed or timed out.");
+                    println!("{}", DISCONNECT_MESSAGE);
+                }
             }
         }
-
-        let incoming_key = request_components[1];
-        let peer_address = request_components[2];
-        let encrypted_port = request_components[3];
-        let ciphertext = request_components[4];
-
-        let mut shared_secret = kyber_private.try_decaps(&deserialize_ciphertext(ciphertext)).expect("Shared secret could not be established.");
-
-        let mut peer_port = decrypt_message(derive_symmetric_key(&shared_secret).as_slice(), encrypted_port);
-
-        clearscreen::clear().unwrap();
-
-        let start_session = Confirm::new()
-            .with_prompt(format!("Incoming Request From Peer:\n{}\n\nInitiate Session?", incoming_key))
-            .interact()
-            .unwrap();
-
-        if start_session {
-            listener_message_mode(TcpStream::connect(
-                                format!("{}:{}", peer_address, peer_port)
-                            ).expect("Failed to connect to peer.")
-            );
-        }
-
-        else {
-            println!("Connection declined.");
-            println!("{}", DISCONNECT_MESSAGE);
-            exit(0);
-        }
-
-        // Securely Zero sensitive values in memory before drop.
-        shared_secret.zeroize();
-        peer_port.zeroize();
     }
-
-    // Securely Zero sensitive values in memory before drop.
-    dilithium_private.zeroize();
-    kyber_private.zeroize();
 }
 
 // The function for the sender to enter message mode.
@@ -337,7 +380,7 @@ fn host_message_mode(mut peer_stream: TcpStream) {
 
     let handshake = read_message(&mut peer_stream);
 
-    if handshake == PEER_AUTHENTICATION {
+    if handshake.expose_secret() == PEER_AUTHENTICATION {
         write_message(&mut peer_stream, PEER_AUTH_RESPONSE.as_bytes()).unwrap();
     }
 
@@ -346,25 +389,20 @@ fn host_message_mode(mut peer_stream: TcpStream) {
 
     // We did key exchange one way over the server. We'll do it
     // the other way around with new keys in the private tunnel.
-    let (morpheus_public, mut morpheus_private) = generate_kyber_keys();
+    let (morpheus_public, morpheus_private) = generate_kyber_keys();
 
-    write_message(&mut peer_stream, serialize_kyber_key(&morpheus_public).as_bytes()).unwrap();
+    write_message(&mut peer_stream, serialize_kyber_key(&morpheus_public).expose_secret().as_bytes()).unwrap();
 
-    let mut ciphertext = deserialize_ciphertext(read_message(&mut peer_stream).as_str());
+    let ciphertext = deserialize_ciphertext(read_message(&mut peer_stream).expose_secret());
 
-    let mut shared_secret = morpheus_private.try_decaps(&ciphertext).unwrap();
-    let symmetric_key = derive_symmetric_key(&shared_secret);
+    let shared_secret = SecretBox::from(Box::from(morpheus_private.expose_secret().try_decaps(ciphertext.expose_secret()).unwrap()));
+    let symmetric_key = derive_symmetric_key(shared_secret.expose_secret());
 
     let test_message = encrypt_message(&symmetric_key, SHARED_SECRET_TEST_MESSAGE);
 
-    write_message(&mut peer_stream, test_message.as_bytes()).unwrap();
+    write_message(&mut peer_stream, test_message.expose_secret().as_bytes()).unwrap();
 
     chatroom(peer_stream, symmetric_key);
-
-    // Securely Zero sensitive values in memory before drop.
-    morpheus_private.zeroize();
-    shared_secret.zeroize();
-    ciphertext.zeroize();
 }
 
 // The function for the recipient to enter message mode.
@@ -375,34 +413,32 @@ fn listener_message_mode(mut peer_stream: TcpStream) {
 
     let handshake_response = read_message(&mut peer_stream);
 
-    if handshake_response == PEER_AUTH_RESPONSE {
+    if handshake_response.expose_secret() == PEER_AUTH_RESPONSE {
 
         // Flip the message order - we want to be the ones doing encapsulation.
         write_message(&mut peer_stream, b"Ready").unwrap();
 
         // We did key exchange one way over the server. We'll do it
         // the other way around with new keys in the private tunnel.
-        let morpheus_public = deserialize_kyber_key(read_message(&mut peer_stream).as_str());
+        let morpheus_public = deserialize_kyber_key(read_message(&mut peer_stream).expose_secret());
 
-        let (mut shared_secret, mut ciphertext) = morpheus_public.try_encaps().unwrap();
+        let (shared_secret, ciphertext) = morpheus_public.expose_secret().try_encaps().map(|(shared_secret, ciphertext)| {
+            (SecretBox::from(Box::from(shared_secret)), SecretBox::from(Box::from(ciphertext)))
+        }).unwrap();
 
-        write_message(&mut peer_stream, serialize_ciphertext(&ciphertext).as_bytes()).unwrap();
+        write_message(&mut peer_stream, serialize_ciphertext(ciphertext.expose_secret()).expose_secret().as_bytes()).unwrap();
 
-        let symmetric_key = derive_symmetric_key(&shared_secret);
+        let symmetric_key = derive_symmetric_key(shared_secret.expose_secret());
 
-        let test_response = decrypt_message(&symmetric_key, read_message(&mut peer_stream).as_str());
+        let test_response = decrypt_message(&symmetric_key, read_message(&mut peer_stream).expose_secret());
 
-        if test_response == SHARED_SECRET_TEST_MESSAGE {
+        if test_response.expose_secret() == SHARED_SECRET_TEST_MESSAGE {
             chatroom(peer_stream, symmetric_key);
         }
-
-        // Securely Zero sensitive values in memory before drop.
-        shared_secret.zeroize();
-        ciphertext.zeroize();
     }
 }
 
-fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
+fn chatroom(mut transmitter: TcpStream, symmetric_key: SecretSlice<u8>) {
     let mut receiver = transmitter.try_clone().unwrap();
 
     let mut transmitter_key = symmetric_key.clone();
@@ -413,11 +449,11 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
     let transmitter_counter = Arc::clone(&message_counter);
     let receiver_counter = Arc::clone(&message_counter);
 
-    let initial_symmetric_key_hash: [u8; 32] = Sha256::digest(symmetric_key.as_slice()).into();
-    let shared_secret_string = hex::encode(&initial_symmetric_key_hash[0..8]);
+    let initial_symmetric_key_hash: [u8; 64] = Sha512::digest(symmetric_key.expose_secret()).into();
+    let shared_secret_string = hex::encode(&initial_symmetric_key_hash[0..16]);
     
     println!("Welcome friend.");
-    println!("Your initial shared secret string is: {}", shared_secret_string);
+    println!("Your initial shared secret string is: {}", String::from_utf8(shared_secret_string).unwrap());
     println!("Please confirm through a third-party channel that this matches with your peer's.");
     println!("This is an important step to prevent man-in-the-middle attacks.\n");
 
@@ -429,9 +465,6 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
                 Ok(message) => {
                     if message.starts_with('>') {
                         if message.to_lowercase().contains("exit") {
-
-                            // Securely Zero the Final Key (Prior keys Zeroed during cycle.)
-                            transmitter_key.zeroize();
                             exit(0);
                         }
 
@@ -449,7 +482,7 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
                     else if !message.is_empty() {
                         transmitter_counter.fetch_add(1, Ordering::SeqCst);
                         let encrypted = encrypt_message(&transmitter_key, message.as_str());
-                        if let Err(e) = write_message(&mut transmitter, encrypted.as_bytes()) {
+                        if let Err(e) = write_message(&mut transmitter, encrypted.expose_secret().as_bytes()) {
                             eprintln!("Error writing to peer: {}", e);
                             transmitter_counter.fetch_sub(1, Ordering::SeqCst);
                             break;
@@ -471,8 +504,8 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
 
         loop {
             match read_message(&mut receiver) {
-                message if !message.is_empty() => {
-                    println!("Peer: {}", decrypt_message(receiver_key.as_slice(), &message));
+                message if !message.expose_secret().is_empty() => {
+                    println!("Peer: {}", decrypt_message(&receiver_key, message.expose_secret()).expose_secret());
                     receiver_counter.fetch_add(1, Ordering::SeqCst);
                     receiver_key = cycle_symmetric_key(receiver_key, &receiver_counter);
                     stdout().flush().unwrap();
@@ -481,17 +514,11 @@ fn chatroom(mut transmitter: TcpStream, mut symmetric_key: Vec<u8>) {
                 
                 _ => {
                     println!("Connection closed by peer.");
-
-                    // Securely Zero the Final Key (Prior keys Zeroed during cycle.)
-                    receiver_key.zeroize();
                     exit(0);
                 }
             }
         }
     });
-
-    // Securely Zero the symmetric key used.
-    symmetric_key.zeroize();
 
     // Prevent Main Thread from terminating while Transmitter and Receiver are running.
     tx.join().unwrap();
@@ -520,13 +547,14 @@ fn get_open_port() -> u16 {
             let search_options = SearchOptions {
                 bind_addr: SocketAddr::new(local_address, 0),
                 broadcast_address: "239.255.255.250:1900".parse().unwrap(),
-                timeout: Some(Duration::from_secs(3600))
+                timeout: Some(Duration::from_secs(3600)),
+                single_search_timeout: Some(Duration::from_secs(60)),
             };
 
             match igd_next::search_gateway(search_options) {
                 Ok(gateway) => {
                     // Pick a port to attempt to open.
-                    let random_port: u16 = OsRng.gen_range(PORT_RANGE);
+                    let random_port: u16 = rand::random_range(PORT_RANGE);
 
                     let socket_address = SocketAddr::new(local_address, random_port);
 
@@ -597,7 +625,8 @@ fn write_message(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
 }
 
 // Function to safely read incoming transmissions.
-fn read_message(stream: &mut TcpStream) -> String {
+fn read_message(stream: &mut TcpStream) -> SecretString {
+
     let mut len_bytes = [0u8; 4];
 
     match stream.read_exact(&mut len_bytes) {
@@ -610,9 +639,11 @@ fn read_message(stream: &mut TcpStream) -> String {
                     let result = String::from_utf8(buffer);
 
                     if let Ok(safe_result) = result {
-                        safe_result
-                    } else {
-                        String::from("Invalid Response")
+                        SecretString::from(safe_result)
+                    }
+
+                    else {
+                        SecretString::from("Invalid Response")
                     }
                 },
                 Err(_) => {
@@ -642,23 +673,26 @@ fn write_to_server(server: &mut TcpStream, data_fragments: Vec<&str>) {
 
 // Serializes a Dilithium public key to hex for transmission.
 // Will not and should not work with private keys - these should never be shared over the network!
-fn serialize_dilithium_key(key: &ml_dsa_87::PublicKey) -> String {
-    let key_bytes = SerDesDilithium::into_bytes(key.clone());
-    hex::encode(key_bytes)
+fn serialize_dilithium_key(key: &SecretBox<ml_dsa_87::PublicKey>) -> SecretString {
+    let key_bytes = SerDesDilithium::into_bytes(key.expose_secret().clone());
+    SecretString::from(String::from_utf8(hex::encode(key_bytes)).unwrap())
 }
 
 // Serializes a signature generated with a Dilithium Private Key for transmission.
-fn serialize_dilithium_signature(key: &ml_dsa_87::PrivateKey, message: &[u8]) -> String {
-    hex::encode(key.try_sign(message, SIGNATURE_CONTEXT)
-        .expect("Unable to encode signature."))
+fn serialize_dilithium_signature(key: &SecretBox<ml_dsa_87::PrivateKey>, message: SecretSlice<u8>) -> SecretString {
+    SecretString::from(String::from_utf8(hex::encode(key.expose_secret().try_sign(message.expose_secret(), SIGNATURE_CONTEXT)
+        .expect("Unable to encode signature."))).unwrap())
 }
 
 // Generate a set of Dilithium keys on their own private thread to avoid blowing up the stack.
-fn generate_dilithium_keys() -> (ml_dsa_87::PublicKey, ml_dsa_87::PrivateKey) {
+fn generate_dilithium_keys() -> (SecretBox<ml_dsa_87::PublicKey>, SecretBox<ml_dsa_87::PrivateKey>) {
     let dilithium_builder = thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // In Bytes - 8MB
         .spawn(|| {
-            ml_dsa_87::try_keygen_with_rng(&mut OsRng)
+            let cha_cha = ChaCha20Rng::from_os_rng();
+            ml_dsa_87::try_keygen_with_rng(&mut FipsChaCha20(cha_cha)).map(|(public_key, private_key)| {
+                (SecretBox::new(Box::new(public_key)), SecretBox::new(Box::new(private_key)))
+            })
         })
         .unwrap();
 
@@ -666,13 +700,16 @@ fn generate_dilithium_keys() -> (ml_dsa_87::PublicKey, ml_dsa_87::PrivateKey) {
 }
 
 // Generate a set of Kyber keys on their own private thread to avoid blowing up the stack.
-fn generate_kyber_keys() -> (ml_kem_1024::EncapsKey, ml_kem_1024::DecapsKey) {
+fn generate_kyber_keys() -> (SecretBox<ml_kem_1024::EncapsKey>, SecretBox<ml_kem_1024::DecapsKey>) {
     // Generate our Kyber keys. Similar to Dilithium, this
     // needs to be offloaded to reduce the Stack Pressure.
     let kyber_builder = thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // In Bytes - 8MB
         .spawn(|| {
-            ml_kem_1024::KG::try_keygen_with_rng(&mut OsRng)
+            let cha_cha = ChaCha20Rng::from_os_rng();
+            ml_kem_1024::KG::try_keygen_with_rng(&mut FipsChaCha20(cha_cha)).map(|(public_key, private_key)| {
+                (SecretBox::new(Box::new(public_key)), SecretBox::new(Box::new(private_key)))
+            })
         })
         .unwrap();
 
@@ -681,162 +718,150 @@ fn generate_kyber_keys() -> (ml_kem_1024::EncapsKey, ml_kem_1024::DecapsKey) {
 
 // Serializes a Kyber public key to hex for transmission.
 // Will not and should not work with private keys - these should never be shared over the network!
-fn serialize_kyber_key(key: &ml_kem_1024::EncapsKey) -> String {
-    let key_bytes = SerDesKyber::into_bytes(key.clone());
-    hex::encode(key_bytes)
+fn serialize_kyber_key(key: &SecretBox<ml_kem_1024::EncapsKey>) -> SecretString {
+    let key_bytes = SerDesKyber::into_bytes(key.expose_secret().clone());
+    SecretString::from(String::from_utf8(hex::encode(key_bytes)).unwrap())
 }
 
 // Reads a hex-encoded Kyber public key. Will not
 // and should not work for private keys - these should
 // never be going out over the network, or we have issues.
-fn deserialize_kyber_key(serial_key: &str) -> ml_kem_1024::EncapsKey {
-    ml_kem_1024::EncapsKey::try_from_bytes(
-        <[u8; 1568]>::try_from(
-            hex::decode(serial_key).
-                expect("Unable to decode public key.")
-        ).expect("Unable to extract public key bytes.")
-    ).expect("Invalid public key.")
+fn deserialize_kyber_key(serial_key: &str) -> SecretBox<ml_kem_1024::EncapsKey> {
+    SecretBox::from(
+        Box::from(
+            ml_kem_1024::EncapsKey::try_from_bytes(
+                <[u8; 1568]>::try_from(
+                    hex::decode(serial_key).
+                        expect("Unable to decode public key.")
+                ).expect("Unable to extract public key bytes.")
+            ).expect("Invalid public key.")
+        )
+    )
 }
 
 // Serializes ciphertext for transmission.
-fn serialize_ciphertext(ciphertext: &ml_kem_1024::CipherText) -> String {
-    hex::encode(ciphertext.clone().into_bytes())
+fn serialize_ciphertext(ciphertext: &ml_kem_1024::CipherText) -> SecretString {
+    SecretString::from(String::from_utf8(hex::encode(ciphertext.clone().into_bytes())).unwrap())
 }
 
 // Deserializes received ciphertext.
-fn deserialize_ciphertext(serial_ciphertext: &str) -> ml_kem_1024::CipherText {
-    ml_kem_1024::CipherText::try_from_bytes(
-        hex::decode(serial_ciphertext)
-            .expect("Unable to decode ciphertext hex.")
-            .try_into()
-            .expect("Invalid ciphertext.")
-    ).expect("Invalid ciphertext.")
+fn deserialize_ciphertext(serial_ciphertext: &str) -> SecretBox<ml_kem_1024::CipherText> {
+    SecretBox::from(
+        Box::from(
+            ml_kem_1024::CipherText::try_from_bytes(
+                hex::decode(serial_ciphertext)
+                    .expect("Unable to decode ciphertext hex.")
+                    .try_into()
+                    .expect("Invalid ciphertext.")
+            ).expect("Invalid ciphertext.")
+        )
+    )
 }
 
 // Derive a symmetric key from a shared secret.
-fn derive_symmetric_key(shared_secret: &SharedSecretKey) -> Vec<u8> {
-    // Use HKDF with SHA256 to derive a 256-bit key (32 bytes) from the shared secret
-    let hk = Hkdf::<Sha256>::new(None, shared_secret.clone().into_bytes().as_slice());
-    let mut okm = [0u8; 32]; // Output key material (32 bytes for AES-256)
-    hk.expand(b"encryption key", &mut okm).unwrap();
-    let result = okm.to_vec();
-    okm.zeroize();
-    result
+fn derive_symmetric_key(shared_secret: &SharedSecretKey) -> SecretSlice<u8> {
+    // Use HKDF with SHA512 to derive a 512-bit key (64 bytes) from the shared secret
+    let hk = Hkdf::<Sha512>::new(None, shared_secret.clone().into_bytes().as_slice());
+    let mut okm = SecretSlice::from(vec![0u8; 32]); // Output key material (32 bytes for AES-256)
+    hk.expand(b"encryption key", okm.expose_secret_mut()).unwrap();
+    okm
 }
 
 // Derive a new symmetric key based on an atomic counter.
-fn cycle_symmetric_key(mut current_key: Vec<u8>, tracker: &AtomicU64) -> Vec<u8> {
-    let hkdf = Hkdf::<Sha256>::new(None, &current_key);
-    let mut new_key = vec![0u8; 32];
-    hkdf.expand(tracker.load(Ordering::Relaxed).to_be_bytes().as_slice(), &mut new_key).unwrap();
-
-    // Securely Zero old key from memory before drop.
-    current_key.zeroize();
+fn cycle_symmetric_key(current_key: SecretSlice<u8>, tracker: &AtomicU64) -> SecretSlice<u8> {
+    let hkdf = Hkdf::<Sha512>::new(None, current_key.expose_secret());
+    let mut new_key = SecretSlice::from(vec![0u8; 32]);
+    hkdf.expand(tracker.load(Ordering::Relaxed).to_be_bytes().as_slice(), new_key.expose_secret_mut()).unwrap();
     new_key
 }
 
 // Encrypt a message using a symmetric key.
-fn encrypt_message(symmetric_key: &[u8], plaintext: &str) -> String {
+fn encrypt_message(symmetric_key: &SecretSlice<u8>, plaintext: &str) -> SecretString {
 
     // Derive separate keys for encryption and HMAC.
-    let hkdf = Hkdf::<Sha256>::new(None, symmetric_key);
-    let mut encryption_key = [0u8; 32];
-    let mut hmac_key = [0u8; 32];
-    hkdf.expand(b"encryption", &mut encryption_key).unwrap();
-    hkdf.expand(b"hmac", &mut hmac_key).unwrap();
+    let hkdf = Hkdf::<Sha512>::new(None, symmetric_key.expose_secret());
+    let mut encryption_key = SecretSlice::from(vec![0u8; 32]);
+    let mut hmac_key = SecretSlice::from(vec![0u8; 32]);
+    hkdf.expand(b"encryption", encryption_key.expose_secret_mut()).unwrap();
+    hkdf.expand(b"hmac", hmac_key.expose_secret_mut()).unwrap();
 
     // AES-GCM requires a random nonce (12 bytes)
-    let mut nonce = random::<[u8; 12]>();
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&encryption_key));
+    let mut cha_cha = ChaCha20Rng::from_os_rng();
+    let nonce = SecretSlice::from(Vec::from(&mut cha_cha.random::<[u8; 12]>()));
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(encryption_key.expose_secret()));
 
     // Pad plaintext to obscure message length.
-    let mut plaintext_bytes = Vec::from(plaintext.as_bytes());
+    let plaintext_bytes = SecretSlice::from(Vec::from(plaintext.as_bytes()));
 
     // All messages are padded to a multiple of 2KB.
-    let padding_byte_length: [u8; 2] = (2048u16 - (plaintext_bytes.len() % 2048) as u16).to_be_bytes();
-    let mut padding_bytes = vec![0u8; u16::from_be_bytes(padding_byte_length) as usize];
+    let padding_byte_length = SecretBox::new(Box::new(2048u16 - (plaintext_bytes.expose_secret().len() % 2048) as u16));
+    let mut padding_bytes = SecretSlice::from(vec![0u8; *padding_byte_length.expose_secret() as usize]);
     
-    OsRng.try_fill_bytes(&mut padding_bytes).expect("Unable to securely pad message.");
+    ChaCha20Rng::from_os_rng().try_fill_bytes(padding_bytes.expose_secret_mut()).expect("Unable to securely pad message.");
     
     // The last two bytes we pad will tell us how many padding bytes we need to strip during
     // decryption. This value will be encrypted along with the plaintext, so leaks no information.
-    padding_bytes.extend(padding_byte_length);
     
-    // Add the padding to the plaintext.
-    plaintext_bytes.extend(padding_bytes);
+    // Plaintext bytes + padding bytes + padding byte length encoded in big-endian.
+    let unciphered_data = SecretSlice::from([plaintext_bytes.expose_secret(), padding_bytes.expose_secret(), padding_byte_length.expose_secret().to_be_bytes().as_slice()].concat());
 
     // Perform encryption.
-    let mut ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), plaintext_bytes.as_slice()).unwrap();
+    let ciphertext = SecretSlice::from(cipher.encrypt(Nonce::from_slice(nonce.expose_secret()), unciphered_data.expose_secret()).unwrap());
 
     // Calculate HMAC of nonce + ciphertext.
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key).unwrap();
-    mac.update(&nonce);
-    mac.update(&ciphertext);
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(hmac_key.expose_secret()).unwrap();
+    mac.update(nonce.expose_secret());
+    mac.update(ciphertext.expose_secret());
     let mac_result = mac.finalize().into_bytes();
 
-    let result = format!("{}{}{}{}{}",
-                         hex::encode(nonce),
-                         NONCE_DELIMITER,
-                         hex::encode(&ciphertext),
-                         NONCE_DELIMITER,
-                         hex::encode(mac_result)
-    );
-
-    // Securely Zero sensitive values in memory before drop.
-    encryption_key.zeroize();
-    hmac_key.zeroize();
-    nonce.zeroize();
-    plaintext_bytes.zeroize();
-    ciphertext.zeroize();
-
-    result
+    SecretString::from(
+        format!("{}{}{}{}{}",
+                             String::from_utf8(hex::encode(nonce.expose_secret())).unwrap(),
+                             NONCE_DELIMITER,
+                             String::from_utf8(hex::encode(ciphertext.expose_secret())).unwrap(),
+                             NONCE_DELIMITER,
+                             String::from_utf8(hex::encode(mac_result)).unwrap()
+        )
+    )
 }
 
 // Decrypt a message using a symmetric key.
-fn decrypt_message(symmetric_key: &[u8], raw_cipher: &str) -> String {
+fn decrypt_message(symmetric_key: &SecretSlice<u8>, raw_cipher: &str) -> SecretString {
     // Derive separate keys for encryption and HMAC
-    let hkdf = Hkdf::<Sha256>::new(None, symmetric_key);
-    let mut encryption_key = [0u8; 32];
-    let mut hmac_key = [0u8; 32];
-    hkdf.expand(b"encryption", &mut encryption_key).unwrap();
-    hkdf.expand(b"hmac", &mut hmac_key).unwrap();
+    let hkdf = Hkdf::<Sha512>::new(None, symmetric_key.expose_secret());
+    let mut encryption_key = SecretSlice::from(vec![0u8; 32]);
+    let mut hmac_key = SecretSlice::from(vec![0u8; 32]);
+    hkdf.expand(b"encryption", encryption_key.expose_secret_mut()).unwrap();
+    hkdf.expand(b"hmac", hmac_key.expose_secret_mut()).unwrap();
 
     let components: Vec<&str> = raw_cipher.split(NONCE_DELIMITER).collect();
 
     if components.len() != 3 {
-        return String::new();
+        return SecretString::default();
     }
 
-    let mut nonce = hex::decode(components[0].trim()).unwrap();
-    let mut ciphertext = hex::decode(components[1].trim()).unwrap();
-    let received_mac = hex::decode(components[2].trim()).unwrap();
+    let nonce = SecretSlice::from(hex::decode(components[0].trim()).unwrap());
+    let ciphertext = SecretSlice::from(hex::decode(components[1].trim()).unwrap());
+    let received_mac = SecretSlice::from(hex::decode(components[2].trim()).unwrap());
 
     // Verify HMAC
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key).unwrap();
-    mac.update(&nonce);
-    mac.update(&ciphertext);
-    if mac.verify_slice(&received_mac).is_err() {
-        return String::new();
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(hmac_key.expose_secret()).unwrap();
+    mac.update(nonce.expose_secret());
+    mac.update(ciphertext.expose_secret());
+    if mac.verify_slice(received_mac.expose_secret()).is_err() {
+        return SecretString::default();
     }
 
     // Perform decryption.
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&encryption_key));
-    let mut plaintext_bytes = cipher.decrypt(
-        Nonce::from_slice(nonce.as_slice()),
-        ciphertext.as_slice()
-    ).unwrap_or_else(|_| Vec::from(b"Decryption error."));
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(encryption_key.expose_secret()));
+    let plaintext_bytes = SecretSlice::from(cipher.decrypt(
+        Nonce::from_slice(nonce.expose_secret()),
+        ciphertext.expose_secret()
+    ).unwrap_or_else(|_| Vec::from(b"Decryption error.")));
 
     // Strip message padding for display.
-    let padding_length = u16::from_be_bytes(plaintext_bytes[plaintext_bytes.len() - 2..].try_into().unwrap());
+    let padding_length = u16::from_be_bytes(plaintext_bytes.expose_secret()[plaintext_bytes.expose_secret().len() - 2..].try_into().unwrap());
     
     // Don't forget to truncate two additional bytes to remove the padding length marker.
-    plaintext_bytes.truncate(plaintext_bytes.len() - (padding_length as usize + 2));
-
-    // Securely Zero sensitive values in memory before drop.
-    encryption_key.zeroize();
-    hmac_key.zeroize();
-    nonce.zeroize();
-    ciphertext.zeroize();
-
-    String::from_utf8(plaintext_bytes).unwrap()
+    SecretString::from(String::from_utf8(plaintext_bytes.expose_secret()[..plaintext_bytes.expose_secret().len() - (padding_length as usize + 2)].to_vec()).unwrap())
 }
