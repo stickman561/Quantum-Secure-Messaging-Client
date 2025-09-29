@@ -25,9 +25,8 @@ use fips204::traits::SerDes as SerDesDilithium;
 use hkdf::Hkdf;
 use hkdf::hmac::{Hmac, Mac};
 use igd_next::{PortMappingProtocol, SearchOptions};
-use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use rand_chacha::rand_core::{RngCore, TryRngCore};
+use rand_chacha::rand_core::{RngCore, SeedableRng, TryRngCore};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretSlice, SecretString};
 use sha2::{Digest, Sha512};
 use subtle_encoding::hex;
@@ -551,7 +550,7 @@ fn get_open_port() -> u16 {
             match igd_next::search_gateway(search_options) {
                 Ok(gateway) => {
                     // Pick a port to attempt to open.
-                    let random_port: u16 = rand::random_range(PORT_RANGE);
+                    let random_port: u16 = *generate_random_in_range_unbiased(*PORT_RANGE.start() as u64, *PORT_RANGE.end() as u64).expose_secret() as u16;
 
                     let socket_address = SocketAddr::new(local_address, random_port);
 
@@ -685,8 +684,7 @@ fn generate_dilithium_keys() -> (SecretBox<ml_dsa_87::PublicKey>, SecretBox<ml_d
     let dilithium_builder = thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // In Bytes - 8MB
         .spawn(|| {
-            let cha_cha = ChaCha20Rng::from_os_rng();
-            ml_dsa_87::try_keygen_with_rng(&mut FipsChaCha20(cha_cha)).map(|(public_key, private_key)| {
+            ml_dsa_87::try_keygen_with_rng(&mut FipsChaCha20(ChaCha20Rng::from_os_rng())).map(|(public_key, private_key)| {
                 (SecretBox::new(Box::new(public_key)), SecretBox::new(Box::new(private_key)))
             })
         })
@@ -702,8 +700,7 @@ fn generate_kyber_keys() -> (SecretBox<ml_kem_1024::EncapsKey>, SecretBox<ml_kem
     let kyber_builder = thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // In Bytes - 8MB
         .spawn(|| {
-            let cha_cha = ChaCha20Rng::from_os_rng();
-            ml_kem_1024::KG::try_keygen_with_rng(&mut FipsChaCha20(cha_cha)).map(|(public_key, private_key)| {
+            ml_kem_1024::KG::try_keygen_with_rng(&mut FipsChaCha20(ChaCha20Rng::from_os_rng())).map(|(public_key, private_key)| {
                 (SecretBox::new(Box::new(public_key)), SecretBox::new(Box::new(private_key)))
             })
         })
@@ -754,6 +751,20 @@ fn deserialize_ciphertext(serial_ciphertext: &str) -> SecretBox<ml_kem_1024::Cip
     )
 }
 
+// Samples a range from secure random data without bias.
+fn generate_random_in_range_unbiased(min: u64, max:u64) -> SecretBox<u64> {
+    let range = max - min + 1;
+    let max_acceptable = (2u64.pow(64) / range) * range - 1;
+
+    loop {
+        let random_value = SecretBox::new(Box::new(ChaCha20Rng::from_os_rng().next_u64()));
+        if random_value.expose_secret() <= &max_acceptable {
+            return SecretBox::new(Box::new(min + (random_value.expose_secret() % range)));
+        }
+    }
+
+}
+
 // Derive a symmetric key from a shared secret.
 fn derive_symmetric_key(shared_secret: &SharedSecretKey) -> SecretSlice<u8> {
     // Use HKDF with SHA512 to derive a 512-bit key (64 bytes) from the shared secret
@@ -783,8 +794,8 @@ fn encrypt_message(symmetric_key: &SecretSlice<u8>, plaintext: &str) -> SecretSt
     hkdf.expand(b"hmac", hmac_key.expose_secret_mut()).unwrap();
 
     // AES-GCM requires a random nonce (12 bytes)
-    let mut cha_cha = ChaCha20Rng::from_os_rng();
-    let nonce = SecretSlice::from(Vec::from(&mut cha_cha.random::<[u8; 12]>()));
+    let mut nonce = SecretSlice::from(vec![0u8; 12]);
+    ChaCha20Rng::from_os_rng().fill_bytes(nonce.expose_secret_mut());
     let cipher = Aes256Gcm::new(GenericArray::from_slice(encryption_key.expose_secret()));
 
     // Pad plaintext to obscure message length.

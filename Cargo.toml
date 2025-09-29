@@ -4,16 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rand = "0.9.0"
 hkdf = "0.12.4"
-sha2 = "0.10.8"
+sha2 = "0.10.9"
 aes-gcm = "0.10.3"
 secrecy = "0.10.3"
-igd-next = "0.16.0"
+igd-next = "0.16.2"
 dialoguer = "0.12.0"
-clearscreen = "4.0.1"
+clearscreen = "4.0.2"
 rand_chacha = "0.9.0"
 subtle-encoding = "0.5.1"
-local-ip-address = "0.6.3"
-fips203 = { version = "0.4.1", features=["ml-kem-1024", "default-rng"] }
-fips204 = { version = "0.4.5", features=["ml-dsa-87", "default-rng"] }
+local-ip-address = "0.6.5"
+fips203 = { version = "0.4.3", features=["ml-kem-1024", "default-rng"] }
+fips204 = { version = "0.4.6", features=["ml-dsa-87", "default-rng"] }
