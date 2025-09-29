@@ -42,7 +42,7 @@ const SIGNATURE_CONTEXT: &[u8] = b"\xCE\xB1";
 // The messages peers and the server should transmit.
 const AUTHENTICATION_REQUEST: &str = "Friend requesting access.";
 const SESSION_REQUEST: &str = "もうすぐ私に会えますよ"; // 山村貞子、『リング』 - Sadako Yamamura/Samara Morgan, The Ring (Remake, 2002)
-const ISSUED_CHALLENGE: &str = "Welcome Anon. Here's your challenge:";
+const ISSUED_CHALLENGE: &str = "Welcome, Anon. Here's your challenge:";
 const VERIFIED_PEER: &str = "You're in.";
 const PEER_KEYS_RECEIVED: &str = "I see you have constructed a new lightsaber."; // Darth Vader, Star Wars (Return of the Jedi, 1983)
 const PEER_CONNECTION_REQUEST: &str = "We Shall Sail Together."; // Sea of Thieves (Rare Games, 2018)
@@ -70,7 +70,7 @@ impl fips203::RngCore for FipsChaCha20 {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest)
+        self.0.fill_bytes(dest);
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
@@ -96,14 +96,14 @@ fn main() {
     // Allow user to enter target exchange server address.
     println!("Enter target exchange server address and port:");
     stdout().flush().unwrap();
-    
+
     let mut target_address = String::new();
     stdin().read_line(&mut target_address).expect("Error reading input.");
     target_address = target_address.trim().to_string();
 
     // Attempt to connect to exchange server.
     let mut server = TcpStream::connect(target_address).expect("Unable to connect to server.");
-    write_to_server(&mut server, vec![AUTHENTICATION_REQUEST]);
+    write_to_server(&mut server, &vec![AUTHENTICATION_REQUEST]);
 
     // Await the server's response. Should contain a greeting and a nonce.
     let response = read_message(&mut server);
@@ -118,12 +118,12 @@ fn main() {
     else if response.expose_secret().contains(ISSUED_CHALLENGE) {
 
         // Sometimes the hex transmitted introduces invisible formatting characters.
-        let nonce_hex = response.expose_secret().split('\n').last().expect("Error receiving nonce.");
+        let nonce_hex = response.expose_secret().split('\n').next_back().expect("Error receiving nonce.");
 
         let nonce = SecretSlice::from(hex::decode(nonce_hex).expect("Unable to decode nonce."));
 
         // Sign the nonce
-        let nonce_signature = serialize_dilithium_signature(&dilithium_private, nonce);
+        let nonce_signature = serialize_dilithium_signature(&dilithium_private, &nonce);
 
         // Transmit the signature to the server. Consists of:
 
@@ -133,7 +133,7 @@ fn main() {
          *   The nonce signed using our private key.
          */
         write_to_server(&mut server,
-                        vec![
+                        &vec![
                             String::from_utf8(serialized_pubkey).expect("Error serializing public key.").as_str(),
                             nonce_hex,
                             nonce_signature.expose_secret()
@@ -164,10 +164,10 @@ fn main() {
              *   the priorly established key to authenticate the signature.
              */
             write_to_server(&mut server,
-                            vec![
+                            &vec![
                                 serialize_dilithium_key(&dilithium_public).expose_secret(),
                                 serialize_kyber_key(&kyber_public).expose_secret(),
-                                serialize_dilithium_signature(&dilithium_private, SecretSlice::from(kyber_public.expose_secret().clone().into_bytes().to_vec())).expose_secret(),
+                                serialize_dilithium_signature(&dilithium_private, &SecretSlice::from(kyber_public.expose_secret().clone().into_bytes().to_vec())).expose_secret(),
                             ]
             );
 
@@ -186,7 +186,7 @@ fn main() {
             exit(0);
         }
     }
-    
+
 }
 
 // Function to handle the peer to peer handoff. The keys are
@@ -197,7 +197,7 @@ fn connection_mode(
     dilithium_private: &SecretBox<ml_dsa_87::PrivateKey>,
     kyber_public: &SecretBox<ml_kem_1024::EncapsKey>,
     kyber_private: &SecretBox<ml_kem_1024::DecapsKey>
-                  )
+)
 {
     // Clear all prior console input.
     clearscreen::clear().unwrap();
@@ -219,7 +219,7 @@ fn connection_mode(
 
     let tx_mode = Select::new()
         .with_prompt("Would you like to send a request, or wait for one?")
-        .items(&["Send", "Await"])
+        .items(["Send", "Await"])
         .default(0)
         .interact()
         .unwrap();
@@ -271,11 +271,11 @@ fn connection_mode(
         let mut flag_signal = TcpStream::connect(server.peer_addr().unwrap()).expect("Unable to initiate flag connection to server.");
 
         write_to_server(&mut flag_signal,
-                        vec![
+                        &vec![
                             SESSION_REQUEST,
                             serialize_kyber_key(kyber_public).expose_secret(),
                             serialize_kyber_key(&peer_kyber_key).expose_secret(),
-                            serialize_dilithium_signature(dilithium_private, SecretBox::from(hex::decode(peer_id.trim()).unwrap())).expose_secret(),
+                            serialize_dilithium_signature(dilithium_private, &SecretBox::from(hex::decode(peer_id.trim()).unwrap())).expose_secret(),
                             encrypt_message(&derive_symmetric_key(&shared_secret), &listening_port.to_string()).expose_secret(),
                             serialize_ciphertext(&ciphertext).expose_secret(),
                         ]
@@ -285,13 +285,13 @@ fn connection_mode(
         // come from our peer assuming that they received and accepted our request.
 
         // Open a listener on our selected port - port should now be open via forwarding or UPnP.
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", listening_port))
+        let listener = TcpListener::bind(format!("0.0.0.0:{listening_port}"))
             .expect("Unable to bind to port.");
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => { host_message_mode(stream); break; },
-                Err(e) => eprintln!("Connection failed: {}", e)
+                Err(e) => eprintln!("Connection failed: {e}")
             }
         }
     }
@@ -322,7 +322,7 @@ fn connection_mode(
                 }
 
                 if incoming_request.expose_secret().contains(HEARTBEAT_PROMPT) {
-                    write_to_server(&mut server, vec![HEARTBEAT_RESPONSE]);
+                    write_to_server(&mut server, &vec![HEARTBEAT_RESPONSE]);
                 }
             }
 
@@ -343,7 +343,7 @@ fn connection_mode(
 
             thread::spawn(move || {
                 let start_session = Confirm::new()
-                    .with_prompt(format!("Incoming Request From Peer:\n{}\n\nInitiate Session?", incoming_key))
+                    .with_prompt(format!("Incoming Request From Peer:\n{incoming_key}\n\nInitiate Session?"))
                     .interact()
                     .unwrap_or(false);
                 let _ = prompter.send(start_session);
@@ -351,21 +351,21 @@ fn connection_mode(
 
             match receiver.recv_timeout(Duration::from_secs(30)) {
                 Ok(true) => {
-                        connection_attempt = true;
-                        listener_message_mode(TcpStream::connect(
-                            format!("{}:{}", peer_address, peer_port.expose_secret())
-                        ).expect("Failed to connect to peer.")
+                    connection_attempt = true;
+                    listener_message_mode(TcpStream::connect(
+                        format!("{}:{}", peer_address, peer_port.expose_secret())
+                    ).expect("Failed to connect to peer.")
                     );
                 },
 
                 Ok(false) => {
                     println!("Connection declined.");
-                    println!("{}", DISCONNECT_MESSAGE);
+                    println!("{DISCONNECT_MESSAGE}");
                 },
 
                 _ => {
                     println!("Connection failed or timed out.");
-                    println!("{}", DISCONNECT_MESSAGE);
+                    println!("{DISCONNECT_MESSAGE}");
                 }
             }
         }
@@ -402,7 +402,7 @@ fn host_message_mode(mut peer_stream: TcpStream) {
 
     write_message(&mut peer_stream, test_message.expose_secret().as_bytes()).unwrap();
 
-    chatroom(peer_stream, symmetric_key);
+    chatroom(peer_stream, &symmetric_key);
 }
 
 // The function for the recipient to enter message mode.
@@ -433,25 +433,25 @@ fn listener_message_mode(mut peer_stream: TcpStream) {
         let test_response = decrypt_message(&symmetric_key, read_message(&mut peer_stream).expose_secret());
 
         if test_response.expose_secret() == SHARED_SECRET_TEST_MESSAGE {
-            chatroom(peer_stream, symmetric_key);
+            chatroom(peer_stream, &symmetric_key);
         }
     }
 }
 
-fn chatroom(mut transmitter: TcpStream, symmetric_key: SecretSlice<u8>) {
+fn chatroom(mut transmitter: TcpStream, symmetric_key: &SecretSlice<u8>) {
     let mut receiver = transmitter.try_clone().unwrap();
 
     let mut transmitter_key = symmetric_key.clone();
     let mut receiver_key = symmetric_key.clone();
-    
+
     let message_counter = Arc::new(AtomicU64::new(0));
-    
+
     let transmitter_counter = Arc::clone(&message_counter);
     let receiver_counter = Arc::clone(&message_counter);
 
     let initial_symmetric_key_hash: [u8; 64] = Sha512::digest(symmetric_key.expose_secret()).into();
     let shared_secret_string = hex::encode(&initial_symmetric_key_hash[0..16]);
-    
+
     println!("Welcome friend.");
     println!("Your initial shared secret string is: {}", String::from_utf8(shared_secret_string).unwrap());
     println!("Please confirm through a third-party channel that this matches with your peer's.");
@@ -459,42 +459,39 @@ fn chatroom(mut transmitter: TcpStream, symmetric_key: SecretSlice<u8>) {
 
     // Transmission thread.
     let tx = thread::spawn(move || {
-        
+
         for line in stdin().lock().lines() {
-            match line {
-                Ok(message) => {
-                    if message.starts_with('>') {
-                        if message.to_lowercase().contains("exit") {
-                            exit(0);
-                        }
-
-                        else if message.to_lowercase().contains("help") {
-                            println!("Current Commands:");
-                            println!("\thelp - Lists Commands");
-                            println!("\texit - Exits The Program");
-                        }
-
-                        else {
-                            println!("Unknown command.");
-                        }
+            if let Ok(message) = line {
+                if message.starts_with('>') {
+                    if message.to_lowercase().contains("exit") {
+                        exit(0);
                     }
 
-                    else if !message.is_empty() {
-                        transmitter_counter.fetch_add(1, Ordering::SeqCst);
-                        let encrypted = encrypt_message(&transmitter_key, message.as_str());
-                        if let Err(e) = write_message(&mut transmitter, encrypted.expose_secret().as_bytes()) {
-                            eprintln!("Error writing to peer: {}", e);
-                            transmitter_counter.fetch_sub(1, Ordering::SeqCst);
-                            break;
-                        }
-                        transmitter_key = cycle_symmetric_key(transmitter_key, &transmitter_counter);
+                    else if message.to_lowercase().contains("help") {
+                        println!("Current Commands:");
+                        println!("\thelp - Lists Commands");
+                        println!("\texit - Exits The Program");
                     }
 
+                    else {
+                        println!("Unknown command.");
+                    }
                 }
-                Err(_) => {
-                    eprintln!("Error reading from console.");
-                    break;
+
+                else if !message.is_empty() {
+                    transmitter_counter.fetch_add(1, Ordering::SeqCst);
+                    let encrypted = encrypt_message(&transmitter_key, message.as_str());
+                    if let Err(e) = write_message(&mut transmitter, encrypted.expose_secret().as_bytes()) {
+                        eprintln!("Error writing to peer: {e}");
+                        transmitter_counter.fetch_sub(1, Ordering::SeqCst);
+                        break;
+                    }
+                    transmitter_key = cycle_symmetric_key(&transmitter_key, &transmitter_counter);
                 }
+
+            } else {
+                eprintln!("Error reading from console.");
+                break;
             }
         }
     });
@@ -507,11 +504,11 @@ fn chatroom(mut transmitter: TcpStream, symmetric_key: SecretSlice<u8>) {
                 message if !message.expose_secret().is_empty() => {
                     println!("Peer: {}", decrypt_message(&receiver_key, message.expose_secret()).expose_secret());
                     receiver_counter.fetch_add(1, Ordering::SeqCst);
-                    receiver_key = cycle_symmetric_key(receiver_key, &receiver_counter);
+                    receiver_key = cycle_symmetric_key(&receiver_key, &receiver_counter);
                     stdout().flush().unwrap();
 
                 }
-                
+
                 _ => {
                     println!("Connection closed by peer.");
                     exit(0);
@@ -532,7 +529,7 @@ fn get_open_port() -> u16 {
     // Decide how to open client port.
     let connection_method = Select::new()
         .with_prompt("Would you like to attempt to auto-open a port with UPnP, or enter an open port on your router?")
-        .items(&["Auto-map with UPnP", "Specify a Port Manually"])
+        .items(["Auto-map with UPnP", "Specify a Port Manually"])
         .default(0)
         .interact()
         .expect("Error processing connection method.");
@@ -568,13 +565,13 @@ fn get_open_port() -> u16 {
                     }
 
                     else {
-                        println!("UPnP blocked. Please specify an open port manually.")
+                        println!("UPnP blocked. Please specify an open port manually.");
                     }
                 },
 
                 Err(e) => {
                     println!("UPnP unable to access gateway. Please specify an open port manually.");
-                    println!("{}", e);
+                    println!("{e}");
                 }
             }
 
@@ -603,9 +600,7 @@ fn get_open_port() -> u16 {
                         break;
                     }
 
-                    else {
-                        println!("Ports must fall within range 1024-49151");
-                    }
+                    println!("Ports must fall within range 1024-49151");
                 }
 
                 Err(_) => println!("Invalid input.")
@@ -618,7 +613,16 @@ fn get_open_port() -> u16 {
 
 // Function to transmit data with length prefixed.
 fn write_message(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-    let len = data.len() as u32;
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let len = u32::try_from(data.len())
+        .map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid data packet."
+        ))?;
+
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(data)?;
     Ok(())
@@ -629,45 +633,37 @@ fn read_message(stream: &mut TcpStream) -> SecretString {
 
     let mut len_bytes = [0u8; 4];
 
-    match stream.read_exact(&mut len_bytes) {
-        Ok(_) => {
-            let len = u32::from_be_bytes(len_bytes) as usize;
-            let mut buffer = vec![0; len];
+    if stream.read_exact(&mut len_bytes).is_ok() {
+        let len = usize::try_from(u32::from_be_bytes(len_bytes)).expect("Corrupted data in stream.");
+        let mut buffer = vec![0; len];
 
-            match stream.read_exact(&mut buffer) {
-                Ok(_) => {
-                    let result = String::from_utf8(buffer);
+        if stream.read_exact(&mut buffer).is_ok() {
+            let result = String::from_utf8(buffer);
 
-                    if let Ok(safe_result) = result {
-                        SecretString::from(safe_result)
-                    }
-
-                    else {
-                        SecretString::from("Invalid Response")
-                    }
-                },
-                Err(_) => {
-                    eprintln!("{}", DISCONNECT_MESSAGE);
-                    exit(0);
-                }
+            if let Ok(safe_result) = result {
+                SecretString::from(safe_result)
             }
-        },
-        Err(_) => {
-            eprintln!("{}", DISCONNECT_MESSAGE);
+
+            else {
+                SecretString::from("Invalid Response")
+            }
+        }
+
+        else {
+            eprintln!("{DISCONNECT_MESSAGE}");
             exit(0);
         }
+    } else {
+        eprintln!("{DISCONNECT_MESSAGE}");
+        exit(0);
     }
 }
 
 // Function to safely write data fragments to the server.
 // They will be automatically delimited with the standard separator.
-fn write_to_server(server: &mut TcpStream, data_fragments: Vec<&str>) {
-
-    // If statement avoids an empty transmission to the server.
-    if !data_fragments.is_empty() {
-        if let Err(e) = write_message(server, data_fragments.join(TRANSMISSION_DELIMITER).as_bytes()) {
-            eprintln!("Error writing to server: {}", e);
-        };
+fn write_to_server(server: &mut TcpStream, data_fragments: &Vec<&str>) {
+    if let Err(e) = write_message(server, data_fragments.join(TRANSMISSION_DELIMITER).as_bytes()) {
+        eprintln!("Error writing to server: {e}");
     }
 }
 
@@ -679,7 +675,7 @@ fn serialize_dilithium_key(key: &SecretBox<ml_dsa_87::PublicKey>) -> SecretStrin
 }
 
 // Serializes a signature generated with a Dilithium Private Key for transmission.
-fn serialize_dilithium_signature(key: &SecretBox<ml_dsa_87::PrivateKey>, message: SecretSlice<u8>) -> SecretString {
+fn serialize_dilithium_signature(key: &SecretBox<ml_dsa_87::PrivateKey>, message: &SecretSlice<u8>) -> SecretString {
     SecretString::from(String::from_utf8(hex::encode(key.expose_secret().try_sign(message.expose_secret(), SIGNATURE_CONTEXT)
         .expect("Unable to encode signature."))).unwrap())
 }
@@ -768,10 +764,11 @@ fn derive_symmetric_key(shared_secret: &SharedSecretKey) -> SecretSlice<u8> {
 }
 
 // Derive a new symmetric key based on an atomic counter.
-fn cycle_symmetric_key(current_key: SecretSlice<u8>, tracker: &AtomicU64) -> SecretSlice<u8> {
+fn cycle_symmetric_key(current_key: &SecretSlice<u8>, tracker: &AtomicU64) -> SecretSlice<u8> {
+    let counter = tracker.fetch_add(1, Ordering::SeqCst);
     let hkdf = Hkdf::<Sha512>::new(None, current_key.expose_secret());
     let mut new_key = SecretSlice::from(vec![0u8; 32]);
-    hkdf.expand(tracker.load(Ordering::Relaxed).to_be_bytes().as_slice(), new_key.expose_secret_mut()).unwrap();
+    hkdf.expand(counter.to_be_bytes().as_slice(), new_key.expose_secret_mut()).unwrap();
     new_key
 }
 
@@ -794,14 +791,14 @@ fn encrypt_message(symmetric_key: &SecretSlice<u8>, plaintext: &str) -> SecretSt
     let plaintext_bytes = SecretSlice::from(Vec::from(plaintext.as_bytes()));
 
     // All messages are padded to a multiple of 2KB.
-    let padding_byte_length = SecretBox::new(Box::new(2048u16 - (plaintext_bytes.expose_secret().len() % 2048) as u16));
-    let mut padding_bytes = SecretSlice::from(vec![0u8; *padding_byte_length.expose_secret() as usize]);
-    
+    let padding_byte_length = SecretBox::new(Box::new(2048u16 - u16::try_from(plaintext_bytes.expose_secret().len() % 2048).expect("Data loss detected.")));
+    let mut padding_bytes = SecretSlice::from(vec![0u8; usize::from(*padding_byte_length.expose_secret())]);
+
     ChaCha20Rng::from_os_rng().try_fill_bytes(padding_bytes.expose_secret_mut()).expect("Unable to securely pad message.");
-    
+
     // The last two bytes we pad will tell us how many padding bytes we need to strip during
     // decryption. This value will be encrypted along with the plaintext, so leaks no information.
-    
+
     // Plaintext bytes + padding bytes + padding byte length encoded in big-endian.
     let unciphered_data = SecretSlice::from([plaintext_bytes.expose_secret(), padding_bytes.expose_secret(), padding_byte_length.expose_secret().to_be_bytes().as_slice()].concat());
 
@@ -816,11 +813,11 @@ fn encrypt_message(symmetric_key: &SecretSlice<u8>, plaintext: &str) -> SecretSt
 
     SecretString::from(
         format!("{}{}{}{}{}",
-                             String::from_utf8(hex::encode(nonce.expose_secret())).unwrap(),
-                             NONCE_DELIMITER,
-                             String::from_utf8(hex::encode(ciphertext.expose_secret())).unwrap(),
-                             NONCE_DELIMITER,
-                             String::from_utf8(hex::encode(mac_result)).unwrap()
+                String::from_utf8(hex::encode(nonce.expose_secret())).unwrap(),
+                NONCE_DELIMITER,
+                String::from_utf8(hex::encode(ciphertext.expose_secret())).unwrap(),
+                NONCE_DELIMITER,
+                String::from_utf8(hex::encode(mac_result)).unwrap()
         )
     )
 }
@@ -861,7 +858,7 @@ fn decrypt_message(symmetric_key: &SecretSlice<u8>, raw_cipher: &str) -> SecretS
 
     // Strip message padding for display.
     let padding_length = u16::from_be_bytes(plaintext_bytes.expose_secret()[plaintext_bytes.expose_secret().len() - 2..].try_into().unwrap());
-    
+
     // Don't forget to truncate two additional bytes to remove the padding length marker.
     SecretString::from(String::from_utf8(plaintext_bytes.expose_secret()[..plaintext_bytes.expose_secret().len() - (padding_length as usize + 2)].to_vec()).unwrap())
 }
